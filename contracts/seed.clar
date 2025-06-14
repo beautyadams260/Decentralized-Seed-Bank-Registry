@@ -309,3 +309,213 @@
 (define-read-only (get-seed-rating (seed-id uint))
   (map-get? seed-ratings { seed-id: seed-id })
 )
+
+(define-data-var last-batch-id uint u0)
+
+(define-map seed-batches
+  { batch-id: uint }
+  {
+    creator: principal,
+    name: (string-ascii 50),
+    processing-date: uint,
+    storage-location: (string-ascii 100),
+    storage-conditions: (string-ascii 200),
+    quality-grade: (string-ascii 20),
+    seed-count: uint,
+    active: bool
+  }
+)
+
+(define-map batch-seeds
+  { batch-id: uint }
+  { seed-ids: (list 50 uint) }
+)
+
+(define-map seed-to-batch
+  { seed-id: uint }
+  { batch-id: uint }
+)
+
+(define-map batch-quality-tests
+  { batch-id: uint }
+  {
+    germination-rate: uint,
+    moisture-content: uint,
+    purity-percentage: uint,
+    test-date: uint,
+    tested-by: principal
+  }
+)
+
+(define-map user-batches
+  { user: principal }
+  { batch-ids: (list 20 uint) }
+)
+
+(define-constant err-batch-not-found (err u200))
+(define-constant err-batch-full (err u201))
+(define-constant err-seed-already-batched (err u202))
+(define-constant err-batch-inactive (err u203))
+(define-constant err-invalid-quality-data (err u204))
+(define-constant err-not-batch-creator (err u205))
+
+(define-public (create-batch 
+    (name (string-ascii 50))
+    (processing-date uint)
+    (storage-location (string-ascii 100))
+    (storage-conditions (string-ascii 200))
+    (quality-grade (string-ascii 20)))
+  (let
+    ((new-batch-id (+ (var-get last-batch-id) u1))
+     (user-batch-list (default-to { batch-ids: (list) } (map-get? user-batches { user: tx-sender }))))
+    (map-set seed-batches
+      { batch-id: new-batch-id }
+      {
+        creator: tx-sender,
+        name: name,
+        processing-date: processing-date,
+        storage-location: storage-location,
+        storage-conditions: storage-conditions,
+        quality-grade: quality-grade,
+        seed-count: u0,
+        active: true
+      }
+    )
+    (map-set batch-seeds
+      { batch-id: new-batch-id }
+      { seed-ids: (list) }
+    )
+    (map-set user-batches
+      { user: tx-sender }
+      { batch-ids: (unwrap! (as-max-len? (append (get batch-ids user-batch-list) new-batch-id) u20) (err u999)) }
+    )
+    (var-set last-batch-id new-batch-id)
+    (ok new-batch-id)
+  )
+)
+
+(define-public (add-seed-to-batch (seed-id uint) (batch-id uint))
+  (let
+    ((batch (unwrap! (map-get? seed-batches { batch-id: batch-id }) err-batch-not-found))
+     (batch-seed-list (unwrap! (map-get? batch-seeds { batch-id: batch-id }) err-batch-not-found))
+     (current-seeds (get seed-ids batch-seed-list)))
+    (asserts! (is-eq (get creator batch) tx-sender) err-not-batch-creator)
+    (asserts! (get active batch) err-batch-inactive)
+    (asserts! (is-none (map-get? seed-to-batch { seed-id: seed-id })) err-seed-already-batched)
+    (asserts! (< (len current-seeds) u50) err-batch-full)
+    (map-set batch-seeds
+      { batch-id: batch-id }
+      { seed-ids: (unwrap! (as-max-len? (append current-seeds seed-id) u50) err-batch-full) }
+    )
+    (map-set seed-to-batch
+      { seed-id: seed-id }
+      { batch-id: batch-id }
+    )
+    (map-set seed-batches
+      { batch-id: batch-id }
+      (merge batch { seed-count: (+ (get seed-count batch) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (remove-seed-from-batch (seed-id uint))
+  (let
+    ((seed-batch-info (unwrap! (map-get? seed-to-batch { seed-id: seed-id }) err-seed-not-found))
+     (batch-id (get batch-id seed-batch-info))
+     (batch (unwrap! (map-get? seed-batches { batch-id: batch-id }) err-batch-not-found))
+     (batch-seed-list (unwrap! (map-get? batch-seeds { batch-id: batch-id }) err-batch-not-found))
+     (current-seeds (get seed-ids batch-seed-list)))
+    (asserts! (is-eq (get creator batch) tx-sender) err-not-batch-creator)
+    (map-set batch-seeds
+      { batch-id: batch-id }
+      { seed-ids: (filter is-not-target-seed current-seeds) }
+    )
+    (map-delete seed-to-batch { seed-id: seed-id })
+    (map-set seed-batches
+      { batch-id: batch-id }
+      (merge batch { seed-count: (- (get seed-count batch) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-private (is-not-target-seed (seed-id uint))
+  (not (is-eq seed-id seed-id))
+)
+
+(define-public (update-batch-storage 
+    (batch-id uint)
+    (storage-location (string-ascii 100))
+    (storage-conditions (string-ascii 200)))
+  (let
+    ((batch (unwrap! (map-get? seed-batches { batch-id: batch-id }) err-batch-not-found)))
+    (asserts! (is-eq (get creator batch) tx-sender) err-not-batch-creator)
+    (map-set seed-batches
+      { batch-id: batch-id }
+      (merge batch {
+        storage-location: storage-location,
+        storage-conditions: storage-conditions
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (record-quality-test 
+    (batch-id uint)
+    (germination-rate uint)
+    (moisture-content uint)
+    (purity-percentage uint))
+  (let
+    ((batch (unwrap! (map-get? seed-batches { batch-id: batch-id }) err-batch-not-found)))
+    (asserts! (is-eq (get creator batch) tx-sender) err-not-batch-creator)
+    (asserts! (<= germination-rate u100) err-invalid-quality-data)
+    (asserts! (<= moisture-content u100) err-invalid-quality-data)
+    (asserts! (<= purity-percentage u100) err-invalid-quality-data)
+    (map-set batch-quality-tests
+      { batch-id: batch-id }
+      {
+        germination-rate: germination-rate,
+        moisture-content: moisture-content,
+        purity-percentage: purity-percentage,
+        test-date: stacks-block-height,
+        tested-by: tx-sender
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (deactivate-batch (batch-id uint))
+  (let
+    ((batch (unwrap! (map-get? seed-batches { batch-id: batch-id }) err-batch-not-found)))
+    (asserts! (is-eq (get creator batch) tx-sender) err-not-batch-creator)
+    (map-set seed-batches
+      { batch-id: batch-id }
+      (merge batch { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-batch-details (batch-id uint))
+  (map-get? seed-batches { batch-id: batch-id })
+)
+
+(define-read-only (get-batch-seeds (batch-id uint))
+  (map-get? batch-seeds { batch-id: batch-id })
+)
+
+(define-read-only (get-seed-batch (seed-id uint))
+  (map-get? seed-to-batch { seed-id: seed-id })
+)
+
+(define-read-only (get-batch-quality (batch-id uint))
+  (map-get? batch-quality-tests { batch-id: batch-id })
+)
+
+(define-read-only (get-user-batches (user principal))
+  (map-get? user-batches { user: user })
+)
+
