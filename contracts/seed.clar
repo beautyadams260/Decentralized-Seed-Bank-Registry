@@ -775,3 +775,316 @@
   (var-get last-auction-id)
 )
 
+;; =====================================
+;; SEED GENETICS & LINEAGE TRACKING
+;; =====================================
+
+(define-data-var last-lineage-id uint u0)
+
+;; Store genetic lineage information for seeds
+(define-map seed-lineage
+  { seed-id: uint }
+  {
+    lineage-id: uint,
+    parent-seed-1: (optional uint),
+    parent-seed-2: (optional uint),
+    generation: uint,
+    breeding-method: (string-ascii 30),
+    breeder: principal,
+    breeding-date: uint,
+    notes: (string-ascii 200)
+  }
+)
+
+;; Store genetic traits for seeds
+(define-map seed-genetics
+  { seed-id: uint }
+  {
+    drought-resistance: uint,
+    cold-tolerance: uint,
+    yield-potential: uint,
+    disease-resistance: uint,
+    maturity-days: uint,
+    plant-height: uint,
+    genetic-purity: uint,
+    documented-traits: (list 10 (string-ascii 50))
+  }
+)
+
+;; Track breeding programs and their participants
+(define-map breeding-programs
+  { program-id: uint }
+  {
+    coordinator: principal,
+    program-name: (string-ascii 100),
+    target-species: (string-ascii 100),
+    objectives: (string-ascii 300),
+    start-date: uint,
+    active: bool,
+    participant-count: uint
+  }
+)
+
+;; Link seeds to breeding programs
+(define-map program-seeds
+  { program-id: uint }
+  { seed-ids: (list 50 uint) }
+)
+
+;; Track program participants
+(define-map program-participants
+  { program-id: uint }
+  { participants: (list 20 principal) }
+)
+
+;; Store offspring records for lineage tracking
+(define-map seed-offspring
+  { parent-seed-id: uint }
+  { offspring-ids: (list 30 uint) }
+)
+
+;; Breeding program counter
+(define-data-var last-program-id uint u0)
+
+;; Error constants for genetics module
+(define-constant err-invalid-genetics-data (err u400))
+(define-constant err-parent-not-found (err u401))
+(define-constant err-lineage-not-found (err u402))
+(define-constant err-program-not-found (err u403))
+(define-constant err-not-program-coordinator (err u404))
+(define-constant err-program-full (err u405))
+(define-constant err-already-in-program (err u406))
+(define-constant err-program-inactive (err u407))
+(define-constant err-invalid-breeding-method (err u408))
+
+;; Record lineage information for a seed
+(define-public (record-seed-lineage 
+    (seed-id uint)
+    (parent-seed-1 (optional uint))
+    (parent-seed-2 (optional uint))
+    (breeding-method (string-ascii 30))
+    (notes (string-ascii 200)))
+  (let
+    ((seed (unwrap! (map-get? seeds { seed-id: seed-id }) err-seed-not-found))
+     (new-lineage-id (+ (var-get last-lineage-id) u1))
+     (generation (calculate-generation parent-seed-1 parent-seed-2)))
+    (asserts! (is-eq (get owner seed) tx-sender) err-not-owner)
+    (asserts! (validate-breeding-method breeding-method) err-invalid-breeding-method)
+    ;; Verify parent seeds exist if provided
+    (match parent-seed-1
+      parent1 (asserts! (is-some (map-get? seeds { seed-id: parent1 })) err-parent-not-found)
+      true
+    )
+    (match parent-seed-2
+      parent2 (asserts! (is-some (map-get? seeds { seed-id: parent2 })) err-parent-not-found)
+      true
+    )
+    (map-set seed-lineage
+      { seed-id: seed-id }
+      {
+        lineage-id: new-lineage-id,
+        parent-seed-1: parent-seed-1,
+        parent-seed-2: parent-seed-2,
+        generation: generation,
+        breeding-method: breeding-method,
+        breeder: tx-sender,
+        breeding-date: stacks-block-height,
+        notes: notes
+      }
+    )
+    ;; Update parent offspring records
+    (match parent-seed-1
+      parent1 (unwrap-panic (update-offspring-record parent1 seed-id))
+      true
+    )
+    (match parent-seed-2
+      parent2 (unwrap-panic (update-offspring-record parent2 seed-id))
+      true
+    )
+    (var-set last-lineage-id new-lineage-id)
+    (ok new-lineage-id)
+  )
+)
+
+;; Record genetic traits for a seed
+(define-public (record-genetic-traits
+    (seed-id uint)
+    (drought-resistance uint)
+    (cold-tolerance uint)
+    (yield-potential uint)
+    (disease-resistance uint)
+    (maturity-days uint)
+    (plant-height uint)
+    (genetic-purity uint)
+    (documented-traits (list 10 (string-ascii 50))))
+  (let
+    ((seed (unwrap! (map-get? seeds { seed-id: seed-id }) err-seed-not-found)))
+    (asserts! (is-eq (get owner seed) tx-sender) err-not-owner)
+    (asserts! (and (<= drought-resistance u100) (<= cold-tolerance u100)) err-invalid-genetics-data)
+    (asserts! (and (<= yield-potential u100) (<= disease-resistance u100)) err-invalid-genetics-data)
+    (asserts! (and (<= genetic-purity u100) (> maturity-days u0)) err-invalid-genetics-data)
+    (asserts! (> plant-height u0) err-invalid-genetics-data)
+    (map-set seed-genetics
+      { seed-id: seed-id }
+      {
+        drought-resistance: drought-resistance,
+        cold-tolerance: cold-tolerance,
+        yield-potential: yield-potential,
+        disease-resistance: disease-resistance,
+        maturity-days: maturity-days,
+        plant-height: plant-height,
+        genetic-purity: genetic-purity,
+        documented-traits: documented-traits
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Create a new breeding program
+(define-public (create-breeding-program
+    (program-name (string-ascii 100))
+    (target-species (string-ascii 100))
+    (objectives (string-ascii 300)))
+  (let
+    ((new-program-id (+ (var-get last-program-id) u1)))
+    (map-set breeding-programs
+      { program-id: new-program-id }
+      {
+        coordinator: tx-sender,
+        program-name: program-name,
+        target-species: target-species,
+        objectives: objectives,
+        start-date: stacks-block-height,
+        active: true,
+        participant-count: u1
+      }
+    )
+    (map-set program-participants
+      { program-id: new-program-id }
+      { participants: (list tx-sender) }
+    )
+    (map-set program-seeds
+      { program-id: new-program-id }
+      { seed-ids: (list) }
+    )
+    (var-set last-program-id new-program-id)
+    (ok new-program-id)
+  )
+)
+
+;; Join a breeding program
+(define-public (join-breeding-program (program-id uint))
+  (let
+    ((program (unwrap! (map-get? breeding-programs { program-id: program-id }) err-program-not-found))
+     (participants (unwrap! (map-get? program-participants { program-id: program-id }) err-program-not-found))
+     (current-participants (get participants participants)))
+    (asserts! (get active program) err-program-inactive)
+    (asserts! (< (len current-participants) u20) err-program-full)
+    (asserts! (is-none (index-of current-participants tx-sender)) err-already-in-program)
+    (map-set program-participants
+      { program-id: program-id }
+      { participants: (unwrap! (as-max-len? (append current-participants tx-sender) u20) err-program-full) }
+    )
+    (map-set breeding-programs
+      { program-id: program-id }
+      (merge program { participant-count: (+ (get participant-count program) u1) })
+    )
+    (ok true)
+  )
+)
+
+;; Add seed to breeding program
+(define-public (add-seed-to-program (seed-id uint) (program-id uint))
+  (let
+    ((seed (unwrap! (map-get? seeds { seed-id: seed-id }) err-seed-not-found))
+     (program (unwrap! (map-get? breeding-programs { program-id: program-id }) err-program-not-found))
+     (program-seed-list (unwrap! (map-get? program-seeds { program-id: program-id }) err-program-not-found))
+     (participants (unwrap! (map-get? program-participants { program-id: program-id }) err-program-not-found))
+     (current-seeds (get seed-ids program-seed-list)))
+    (asserts! (is-eq (get owner seed) tx-sender) err-not-owner)
+    (asserts! (get active program) err-program-inactive)
+    (asserts! (is-some (index-of (get participants participants) tx-sender)) err-not-authorized)
+    (asserts! (< (len current-seeds) u50) err-program-full)
+    (map-set program-seeds
+      { program-id: program-id }
+      { seed-ids: (unwrap! (as-max-len? (append current-seeds seed-id) u50) err-program-full) }
+    )
+    (ok true)
+  )
+)
+
+;; Update offspring record when new lineage is created
+(define-private (update-offspring-record (parent-id uint) (offspring-id uint))
+  (let
+    ((current-offspring (default-to { offspring-ids: (list) } (map-get? seed-offspring { parent-seed-id: parent-id })))
+     (offspring-list (get offspring-ids current-offspring)))
+    (map-set seed-offspring
+      { parent-seed-id: parent-id }
+      { offspring-ids: (unwrap! (as-max-len? (append offspring-list offspring-id) u30) (err u999)) }
+    )
+    (ok true)
+  )
+)
+
+;; Calculate generation based on parent generations
+(define-private (calculate-generation (parent1 (optional uint)) (parent2 (optional uint)))
+  (let
+    ((gen1 (match parent1
+             p1 (match (map-get? seed-lineage { seed-id: p1 })
+                   lineage (get generation lineage)
+                   u0)
+             u0))
+     (gen2 (match parent2
+             p2 (match (map-get? seed-lineage { seed-id: p2 })
+                   lineage (get generation lineage)
+                   u0)
+             u0)))
+    (+ (if (> gen1 gen2) gen1 gen2) u1)
+  )
+)
+
+;; Validate breeding method
+(define-private (validate-breeding-method (method (string-ascii 30)))
+  (or (is-eq method "open-pollination")
+      (is-eq method "controlled-cross")
+      (is-eq method "self-pollination")
+      (is-eq method "hybrid")
+      (is-eq method "mutation")
+      (is-eq method "selection"))
+)
+
+;; Read-only functions for genetics module
+
+(define-read-only (get-seed-lineage (seed-id uint))
+  (map-get? seed-lineage { seed-id: seed-id })
+)
+
+(define-read-only (get-seed-genetics (seed-id uint))
+  (map-get? seed-genetics { seed-id: seed-id })
+)
+
+(define-read-only (get-breeding-program (program-id uint))
+  (map-get? breeding-programs { program-id: program-id })
+)
+
+(define-read-only (get-program-participants (program-id uint))
+  (map-get? program-participants { program-id: program-id })
+)
+
+(define-read-only (get-program-seeds (program-id uint))
+  (map-get? program-seeds { program-id: program-id })
+)
+
+(define-read-only (get-seed-offspring (parent-seed-id uint))
+  (map-get? seed-offspring { parent-seed-id: parent-seed-id })
+)
+
+(define-read-only (get-lineage-count)
+  (var-get last-lineage-id)
+)
+
+(define-read-only (get-program-count)
+  (var-get last-program-id)
+)
+
