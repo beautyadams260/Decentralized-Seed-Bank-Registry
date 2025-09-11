@@ -1088,3 +1088,290 @@
   (var-get last-program-id)
 )
 
+;; =====================================
+;; SEED EXCHANGE NETWORK
+;; =====================================
+
+(define-data-var last-exchange-id uint u0)
+
+;; Store seed exchange proposals
+(define-map seed-exchanges
+  { exchange-id: uint }
+  {
+    proposer: principal,
+    offered-seed-id: uint,
+    offered-quantity: uint,
+    desired-species: (string-ascii 100),
+    desired-origin: (string-ascii 50),
+    min-desired-quantity: uint,
+    exchange-notes: (string-ascii 200),
+    status: (string-ascii 20),
+    created-time: uint,
+    expires-time: uint,
+    accepted-by: (optional principal),
+    accepted-seed-id: (optional uint)
+  }
+)
+
+;; Track exchange responses to proposals
+(define-map exchange-responses
+  { exchange-id: uint, responder: principal }
+  {
+    offered-seed-id: uint,
+    offered-quantity: uint,
+    response-time: uint,
+    message: (string-ascii 100)
+  }
+)
+
+;; Store completed exchange history
+(define-map exchange-history
+  { exchange-id: uint }
+  {
+    proposer: principal,
+    accepter: principal,
+    proposer-seed-id: uint,
+    accepter-seed-id: uint,
+    proposer-quantity: uint,
+    accepter-quantity: uint,
+    completion-time: uint
+  }
+)
+
+;; User exchange preferences and statistics
+(define-map user-exchange-profile
+  { user: principal }
+  {
+    preferred-species: (list 5 (string-ascii 100)),
+    exchange-region: (string-ascii 50),
+    successful-exchanges: uint,
+    failed-exchanges: uint,
+    reputation-score: uint,
+    last-active: uint
+  }
+)
+
+;; Track user's active exchange proposals
+(define-map user-exchanges
+  { user: principal }
+  { exchange-ids: (list 10 uint) }
+)
+
+;; Regional exchange networks for community building
+(define-map regional-networks
+  { region: (string-ascii 50) }
+  {
+    active-exchanges: uint,
+    total-completed: uint,
+    participating-users: uint,
+    network-coordinator: (optional principal)
+  }
+)
+
+;; Error constants for exchange system
+(define-constant err-exchange-not-found (err u500))
+(define-constant err-exchange-expired (err u501))
+(define-constant err-cannot-exchange-own-seed (err u502))
+(define-constant err-exchange-already-accepted (err u503))
+(define-constant err-insufficient-exchange-quantity (err u504))
+(define-constant err-species-mismatch (err u505))
+(define-constant err-exchange-not-accepted (err u506))
+(define-constant err-not-exchange-participant (err u507))
+
+;; Create a new seed exchange proposal
+(define-public (create-exchange-proposal
+    (offered-seed-id uint)
+    (offered-quantity uint)
+    (desired-species (string-ascii 100))
+    (desired-origin (string-ascii 50))
+    (min-desired-quantity uint)
+    (exchange-notes (string-ascii 200))
+    (duration uint))
+  (let
+    ((seed (unwrap! (map-get? seeds { seed-id: offered-seed-id }) err-seed-not-found))
+     (new-exchange-id (+ (var-get last-exchange-id) u1))
+     (current-time stacks-block-height)
+     (user-exchange-list (default-to { exchange-ids: (list) } (map-get? user-exchanges { user: tx-sender }))))
+    (asserts! (is-eq (get owner seed) tx-sender) err-not-owner)
+    (asserts! (<= offered-quantity (get quantity seed)) err-insufficient-quantity)
+    (asserts! (> offered-quantity u0) err-insufficient-quantity)
+    (asserts! (> min-desired-quantity u0) err-insufficient-exchange-quantity)
+    (asserts! (> duration u0) err-invalid-auction-time)
+    (map-set seed-exchanges
+      { exchange-id: new-exchange-id }
+      {
+        proposer: tx-sender,
+        offered-seed-id: offered-seed-id,
+        offered-quantity: offered-quantity,
+        desired-species: desired-species,
+        desired-origin: desired-origin,
+        min-desired-quantity: min-desired-quantity,
+        exchange-notes: exchange-notes,
+        status: "active",
+        created-time: current-time,
+        expires-time: (+ current-time duration),
+        accepted-by: none,
+        accepted-seed-id: none
+      }
+    )
+    (map-set user-exchanges
+      { user: tx-sender }
+      { exchange-ids: (unwrap! (as-max-len? (append (get exchange-ids user-exchange-list) new-exchange-id) u10) (err u999)) }
+    )
+    (var-set last-exchange-id new-exchange-id)
+    (ok new-exchange-id)
+  )
+)
+
+;; Respond to an exchange proposal with a counter-offer
+(define-public (respond-to-exchange
+    (exchange-id uint)
+    (offered-seed-id uint)
+    (offered-quantity uint)
+    (message (string-ascii 100)))
+  (let
+    ((exchange (unwrap! (map-get? seed-exchanges { exchange-id: exchange-id }) err-exchange-not-found))
+     (offered-seed (unwrap! (map-get? seeds { seed-id: offered-seed-id }) err-seed-not-found))
+     (current-time stacks-block-height))
+    (asserts! (is-eq (get status exchange) "active") err-exchange-expired)
+    (asserts! (< current-time (get expires-time exchange)) err-exchange-expired)
+    (asserts! (not (is-eq (get proposer exchange) tx-sender)) err-cannot-exchange-own-seed)
+    (asserts! (is-eq (get owner offered-seed) tx-sender) err-not-owner)
+    (asserts! (<= offered-quantity (get quantity offered-seed)) err-insufficient-quantity)
+    (asserts! (>= offered-quantity (get min-desired-quantity exchange)) err-insufficient-exchange-quantity)
+    (asserts! (is-eq (get species offered-seed) (get desired-species exchange)) err-species-mismatch)
+    (map-set exchange-responses
+      { exchange-id: exchange-id, responder: tx-sender }
+      {
+        offered-seed-id: offered-seed-id,
+        offered-quantity: offered-quantity,
+        response-time: current-time,
+        message: message
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Accept a specific exchange response
+(define-public (accept-exchange-response
+    (exchange-id uint)
+    (responder principal))
+  (let
+    ((exchange (unwrap! (map-get? seed-exchanges { exchange-id: exchange-id }) err-exchange-not-found))
+     (response (unwrap! (map-get? exchange-responses { exchange-id: exchange-id, responder: responder }) err-exchange-not-found)))
+    (asserts! (is-eq (get proposer exchange) tx-sender) err-not-authorized)
+    (asserts! (is-eq (get status exchange) "active") err-exchange-already-accepted)
+    (map-set seed-exchanges
+      { exchange-id: exchange-id }
+      (merge exchange {
+        status: "accepted",
+        accepted-by: (some responder),
+        accepted-seed-id: (some (get offered-seed-id response))
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Complete the seed exchange
+(define-public (complete-exchange (exchange-id uint))
+  (let
+    ((exchange (unwrap! (map-get? seed-exchanges { exchange-id: exchange-id }) err-exchange-not-found))
+     (accepter (unwrap! (get accepted-by exchange) err-exchange-not-accepted))
+     (accepted-seed-id (unwrap! (get accepted-seed-id exchange) err-exchange-not-accepted))
+     (response (unwrap! (map-get? exchange-responses { exchange-id: exchange-id, responder: accepter }) err-exchange-not-found))
+     (proposer-seed (unwrap! (map-get? seeds { seed-id: (get offered-seed-id exchange) }) err-seed-not-found))
+     (accepter-seed (unwrap! (map-get? seeds { seed-id: accepted-seed-id }) err-seed-not-found))
+     (proposer-remaining (- (get quantity proposer-seed) (get offered-quantity exchange)))
+     (accepter-remaining (- (get quantity accepter-seed) (get offered-quantity response))))
+    (asserts! (or (is-eq tx-sender (get proposer exchange)) (is-eq tx-sender accepter)) err-not-exchange-participant)
+    (asserts! (is-eq (get status exchange) "accepted") err-exchange-not-accepted)
+    ;; Update seed quantities or remove if depleted
+    (if (is-eq proposer-remaining u0)
+      (map-delete seeds { seed-id: (get offered-seed-id exchange) })
+      (map-set seeds { seed-id: (get offered-seed-id exchange) }
+        (merge proposer-seed { quantity: proposer-remaining }))
+    )
+    (if (is-eq accepter-remaining u0)
+      (map-delete seeds { seed-id: accepted-seed-id })
+      (map-set seeds { seed-id: accepted-seed-id }
+        (merge accepter-seed { quantity: accepter-remaining }))
+    )
+    ;; Record exchange completion
+    (map-set exchange-history
+      { exchange-id: exchange-id }
+      {
+        proposer: (get proposer exchange),
+        accepter: accepter,
+        proposer-seed-id: (get offered-seed-id exchange),
+        accepter-seed-id: accepted-seed-id,
+        proposer-quantity: (get offered-quantity exchange),
+        accepter-quantity: (get offered-quantity response),
+        completion-time: stacks-block-height
+      }
+    )
+    (map-set seed-exchanges
+      { exchange-id: exchange-id }
+      (merge exchange { status: "completed" })
+    )
+    (ok true)
+  )
+)
+
+;; Update user exchange preferences
+(define-public (update-exchange-profile
+    (preferred-species (list 5 (string-ascii 100)))
+    (exchange-region (string-ascii 50)))
+  (let
+    ((current-profile (default-to
+       {
+         preferred-species: (list),
+         exchange-region: "",
+         successful-exchanges: u0,
+         failed-exchanges: u0,
+         reputation-score: u50,
+         last-active: u0
+       }
+       (map-get? user-exchange-profile { user: tx-sender }))))
+    (map-set user-exchange-profile
+      { user: tx-sender }
+      (merge current-profile {
+        preferred-species: preferred-species,
+        exchange-region: exchange-region,
+        last-active: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Read-only functions for exchange system
+(define-read-only (get-exchange-details (exchange-id uint))
+  (map-get? seed-exchanges { exchange-id: exchange-id })
+)
+
+(define-read-only (get-exchange-response (exchange-id uint) (responder principal))
+  (map-get? exchange-responses { exchange-id: exchange-id, responder: responder })
+)
+
+(define-read-only (get-exchange-history (exchange-id uint))
+  (map-get? exchange-history { exchange-id: exchange-id })
+)
+
+(define-read-only (get-user-exchange-profile (user principal))
+  (map-get? user-exchange-profile { user: user })
+)
+
+(define-read-only (get-user-exchanges (user principal))
+  (map-get? user-exchanges { user: user })
+)
+
+(define-read-only (get-regional-network (region (string-ascii 50)))
+  (map-get? regional-networks { region: region })
+)
+
+(define-read-only (get-total-exchanges)
+  (var-get last-exchange-id)
+)
+
